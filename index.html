@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Fractal Forge GPU Benchmark</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      color: #fff;
+      font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+    #glcanvas {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      background: #000;
+      touch-action: none;
+      cursor: grab;
+    }
+    #glcanvas:active {
+      cursor: grabbing;
+    }
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.45;
+      pointer-events: none;
+      white-space: nowrap;
+      box-shadow: 0 0 14px rgba(0, 0, 0, 0.45);
+      letter-spacing: 0.02em;
+    }
+    #info {
+      position: fixed;
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.35);
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 12px;
+      pointer-events: none;
+      text-align: center;
+      letter-spacing: 0.02em;
+    }
+    a { color: #8cf; }
+  </style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+<div id="hud"></div>
+<div id="info">Pitch/Roll only: drag (vertical look, horizontal tilt) • Fine roll: Shift+drag or Q/E • Zoom: wheel/pinch • Reset: double-tap</div>
+<script>
+(function () {
+  const canvas = document.getElementById('glcanvas');
+  const hud = document.getElementById('hud');
+  const info = document.getElementById('info');
+
+  let gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+  let isWebGL2 = true;
+  if (!gl) {
+    gl = canvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: false });
+    isWebGL2 = false;
+  }
+  if (!gl) {
+    hud.textContent = 'Unable to initialize WebGL. Your browser or device may not support it.';
+    return;
+  }
+
+  const vertexSource = `
+    attribute vec2 a_position;
+    void main() {
+      gl_Position = vec4(a_position, 0.0, 1.0);
+    }
+  `;
+
+  const fragmentSource = `
+    precision highp float;
+
+    uniform vec2 u_resolution;
+    uniform float u_time;
+    uniform mat3 u_camera;
+    uniform vec3 u_cameraPos;
+    uniform float u_stepScale;
+    uniform float u_difficulty;
+    uniform int u_passIndex;
+    uniform int u_totalPasses;
+    uniform vec2 u_jitter;
+    uniform float u_maxSteps;
+    uniform float u_fractalIterations;
+
+    const float FAR_CLIP = 80.0;
+
+    float hash(vec3 p) {
+      return fract(sin(dot(p, vec3(7.13, 157.31, 113.53))) * 43758.5453);
+    }
+
+    vec2 rotate2D(vec2 v, float a) {
+      float s = sin(a);
+      float c = cos(a);
+      return vec2(v.x * c - v.y * s, v.x * s + v.y * c);
+    }
+
+    float mandelbulbDE(vec3 p, out float trap) {
+      vec3 z = p;
+      float dr = 1.0;
+      float r = 0.0;
+      trap = 1e9;
+      float iterLimit = u_fractalIterations;
+      float dynamicPower = 7.4 + sin(u_time * 0.27) * 1.4 + clamp(u_difficulty * 0.18, 0.0, 6.0);
+      for (int i = 0; i < 24; i++) {
+        if (float(i) >= iterLimit) break;
+        r = length(z);
+        trap = min(trap, r);
+        if (r > 8.0) break;
+        float theta = acos(clamp(z.z / max(r, 1e-6), -1.0, 1.0));
+        float phi = atan(z.y, z.x);
+        float zr = pow(max(r, 1e-6), dynamicPower);
+        dr = pow(max(r, 1e-6), dynamicPower - 1.0) * dynamicPower * dr + 1.0;
+        theta = theta * dynamicPower + 0.32 * sin(u_time * 0.38 + float(i) * 0.71);
+        phi = phi * dynamicPower + 0.27 * cos(u_time * 0.31 + float(i) * 0.63);
+        z = zr * vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+        z += p;
+      }
+      float dist = 0.5 * log(max(r, 1e-6)) * r / dr;
+      return abs(dist);
+    }
+
+    float mapFractal(vec3 p, out float trap) {
+      float anim = u_time * 0.35 + float(u_passIndex) * 0.025;
+      vec3 q = p;
+      q.xy = rotate2D(q.xy, anim);
+      q.xz = rotate2D(q.xz, anim * 0.72);
+      q.yz = rotate2D(q.yz, anim * 0.53);
+      q += 0.12 * sin(q.zxy * 2.6 + u_time * 0.55);
+      float d = mandelbulbDE(q, trap);
+      return d * 0.74;
+    }
+
+    float mapFractal(vec3 p) {
+      float trap;
+      return mapFractal(p, trap);
+    }
+
+    vec3 estimateNormal(vec3 p, float eps) {
+      vec3 e = vec3(eps, 0.0, 0.0);
+      return normalize(vec3(
+        mapFractal(p + e.xyy) - mapFractal(p - e.xyy),
+        mapFractal(p + e.yxy) - mapFractal(p - e.yxy),
+        mapFractal(p + e.yyx) - mapFractal(p - e.yyx)
+      ));
+    }
+
+    vec3 computeColor(vec3 ro, vec3 rd, out float hitDist) {
+      float total = 0.0;
+      float minTrap = 1e9;
+      bool hit = false;
+      float dist = 0.0;
+      float passPhase = (float(u_passIndex) + 0.5) / max(float(u_totalPasses), 1.0);
+      for (int i = 0; i < 256; i++) {
+        if (float(i) >= u_maxSteps) break;
+        vec3 pos = ro + rd * total;
+        float trap;
+        dist = mapFractal(pos, trap);
+        minTrap = min(minTrap, trap);
+        if (dist < 0.0013 * u_stepScale) {
+          hit = true;
+          break;
+        }
+        total += dist * u_stepScale;
+        if (total > FAR_CLIP) break;
+      }
+      if (hit) {
+        vec3 pos = ro + rd * total;
+        float eps = 0.0008 + 0.004 * u_stepScale;
+        vec3 normal = estimateNormal(pos, eps);
+        vec3 lightDir1 = normalize(vec3(0.6, 0.73, 0.5));
+        vec3 lightDir2 = normalize(vec3(-0.45, 0.34, -0.78));
+        float diff1 = max(dot(normal, lightDir1), 0.0);
+        float diff2 = max(dot(normal, lightDir2), 0.0);
+        vec3 viewDir = normalize(-rd);
+        float spec1 = pow(max(dot(reflect(-lightDir1, normal), viewDir), 0.0), 24.0 + u_difficulty * 1.6);
+        float spec2 = pow(max(dot(reflect(-lightDir2, normal), viewDir), 0.0), 16.0);
+        float fresnel = pow(1.0 - max(dot(normal, viewDir), 0.0), 3.2);
+        float ao = clamp(1.0 - minTrap * 0.53, 0.18, 1.0);
+        float glow = exp(-minTrap * 2.1) * 0.55;
+        float ridge = pow(clamp(1.0 - minTrap * 0.42, 0.0, 1.0), 2.2);
+        vec3 base = mix(vec3(0.12, 0.18, 0.28), vec3(0.93, 0.55, 0.28), smoothstep(0.0, 1.3, minTrap));
+        base += 0.25 * vec3(0.18, 0.45, 0.75) * glow;
+        base += 0.16 * vec3(0.8, 0.9, 0.5) * ridge;
+        base += 0.05 * sin(vec3(2.3, 2.8, 3.5) * (minTrap * 1.9 + u_time + passPhase));
+        vec3 lighting = base * (0.35 + 0.95 * diff1 + 0.45 * diff2);
+        lighting += vec3(1.0, 0.9, 0.7) * spec1 * 0.55;
+        lighting += vec3(0.4, 0.7, 0.9) * spec2 * 0.35;
+        lighting += fresnel * vec3(0.55, 0.65, 0.9) * 0.45;
+        lighting *= ao;
+        lighting += passPhase * 0.04 * vec3(0.18, 0.26, 0.45);
+        float fog = exp(-0.034 * total);
+        vec3 background = mix(vec3(0.015, 0.02, 0.04), vec3(0.05, 0.07, 0.12), clamp(0.5 + 0.5 * rd.y, 0.0, 1.0));
+        vec3 col = mix(background, lighting, fog);
+        col += fresnel * 0.08 * vec3(0.8, 0.95, 1.1);
+        hitDist = total;
+        return col;
+      } else {
+        float skyFactor = clamp(0.5 + 0.5 * rd.y, 0.0, 1.0);
+        vec3 skyTop = vec3(0.05, 0.08, 0.16);
+        vec3 skyBottom = vec3(0.01, 0.015, 0.035);
+        vec3 background = mix(skyBottom, skyTop, skyFactor);
+        float stars = pow(max(hash(rd * 128.0 + vec3(u_time * 0.1)), 0.0), 18.0);
+        background += stars * vec3(0.8, 0.85, 1.0);
+        background += 0.02 * (float(u_passIndex) + 1.0) / max(float(u_totalPasses), 1.0);
+        hitDist = FAR_CLIP;
+        return background;
+      }
+    }
+
+    void main() {
+      vec2 fragCoord = gl_FragCoord.xy + u_jitter;
+      vec2 uv = fragCoord / u_resolution;
+      vec2 p = uv * 2.0 - 1.0;
+      p.x *= u_resolution.x / u_resolution.y;
+      float focal = 1.55;
+      vec3 rd = normalize(u_camera * vec3(p, focal));
+      vec3 ro = u_cameraPos;
+      float hitDist;
+      vec3 color = computeColor(ro, rd, hitDist);
+      color = pow(clamp(color, 0.0, 1.0), vec3(0.92));
+      gl_FragColor = vec4(color, 1.0);
+    }
+  `;
+
+  function compileShader(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const info = gl.getShaderInfoLog(shader) || 'Shader compile failed';
+      gl.deleteShader(shader);
+      throw new Error(info);
+    }
+    return shader;
+  }
+
+  function createProgram(vsSource, fsSource) {
+    const vs = compileShader(gl.VERTEX_SHADER, vsSource);
+    const fs = compileShader(gl.FRAGMENT_SHADER, fsSource);
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      const info = gl.getProgramInfoLog(program) || 'Program link failed';
+      gl.deleteProgram(program);
+      throw new Error(info);
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    return program;
+  }
+
+  const program = createProgram(vertexSource, fragmentSource);
+  gl.useProgram(program);
+
+  const quadBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1, -1,
+     1, -1,
+    -1,  1,
+     1,  1,
+  ]), gl.STATIC_DRAW);
+
+  const positionLocation = gl.getAttribLocation(program, 'a_position');
+  gl.enableVertexAttribArray(positionLocation);
+  gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+  const uniforms = {
+    resolution: gl.getUniformLocation(program, 'u_resolution'),
+    time: gl.getUniformLocation(program, 'u_time'),
+    camera: gl.getUniformLocation(program, 'u_camera'),
+    cameraPos: gl.getUniformLocation(program, 'u_cameraPos'),
+    stepScale: gl.getUniformLocation(program, 'u_stepScale'),
+    difficulty: gl.getUniformLocation(program, 'u_difficulty'),
+    passIndex: gl.getUniformLocation(program, 'u_passIndex'),
+    totalPasses: gl.getUniformLocation(program, 'u_totalPasses'),
+    jitter: gl.getUniformLocation(program, 'u_jitter'),
+    maxSteps: gl.getUniformLocation(program, 'u_maxSteps'),
+    fractalIterations: gl.getUniformLocation(program, 'u_fractalIterations'),
+  };
+
+  gl.clearColor(0.0, 0.0, 0.0, 1.0);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+
+  const CAMERA_DISTANCE_INITIAL = 5.0;
+
+  const camera = {
+    yaw: 0.9,
+    pitch: 0.35,
+    roll: 0.0,
+    distance: CAMERA_DISTANCE_INITIAL,
+  };
+
+  const cameraMatrix = new Float32Array(9);
+  const cameraPos = new Float32Array(3);
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
+  function lengthVec3(v) {
+    return Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  }
+
+  function normalizeVec3(v) {
+    const len = lengthVec3(v);
+    if (len > 1e-6) {
+      v[0] /= len;
+      v[1] /= len;
+      v[2] /= len;
+    }
+    return v;
+  }
+
+  function crossVec3(a, b) {
+    return [
+      a[1] * b[2] - a[2] * b[1],
+      a[2] * b[0] - a[0] * b[2],
+      a[0] * b[1] - a[1] * b[0],
+    ];
+  }
+
+  function updateCamera() {
+    const sinYaw = Math.sin(camera.yaw);
+    const cosYaw = Math.cos(camera.yaw);
+    const sinPitch = Math.sin(camera.pitch);
+    const cosPitch = Math.cos(camera.pitch);
+    const pos = [
+      camera.distance * cosPitch * sinYaw,
+      camera.distance * sinPitch,
+      camera.distance * cosPitch * cosYaw,
+    ];
+    const forward = normalizeVec3([-pos[0], -pos[1], -pos[2]]);
+    let right = crossVec3([0, 1, 0], forward);
+    if (lengthVec3(right) < 1e-5) {
+      right = crossVec3([1, 0, 0], forward);
+    }
+    right = normalizeVec3(right);
+    let up = crossVec3(forward, right);
+    up = normalizeVec3(up);
+    const cosRoll = Math.cos(camera.roll);
+    const sinRoll = Math.sin(camera.roll);
+    const rolledRight = [
+      right[0] * cosRoll + up[0] * sinRoll,
+      right[1] * cosRoll + up[1] * sinRoll,
+      right[2] * cosRoll + up[2] * sinRoll,
+    ];
+    const rolledUp = [
+      up[0] * cosRoll - right[0] * sinRoll,
+      up[1] * cosRoll - right[1] * sinRoll,
+      up[2] * cosRoll - right[2] * sinRoll,
+    ];
+    cameraPos[0] = pos[0];
+    cameraPos[1] = pos[1];
+    cameraPos[2] = pos[2];
+    cameraMatrix[0] = rolledRight[0];
+    cameraMatrix[1] = rolledRight[1];
+    cameraMatrix[2] = rolledRight[2];
+    cameraMatrix[3] = rolledUp[0];
+    cameraMatrix[4] = rolledUp[1];
+    cameraMatrix[5] = rolledUp[2];
+    cameraMatrix[6] = forward[0];
+    cameraMatrix[7] = forward[1];
+    cameraMatrix[8] = forward[2];
+  }
+
+  const CAMERA_DISTANCE_MIN = 2.0;
+  const CAMERA_DISTANCE_MAX = CAMERA_DISTANCE_INITIAL;
+  const PITCH_LIMIT = Math.PI / 2 - 0.05;
+
+  function clampCamera() {
+    camera.yaw = 0.9;
+    camera.distance = clamp(camera.distance, CAMERA_DISTANCE_MIN, CAMERA_DISTANCE_MAX);
+    camera.pitch = clamp(camera.pitch, -PITCH_LIMIT, PITCH_LIMIT);
+    if (camera.roll > Math.PI) {
+      camera.roll -= Math.PI * 2;
+    } else if (camera.roll < -Math.PI) {
+      camera.roll += Math.PI * 2;
+    }
+  }
+
+  function resizeCanvas() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.0);
+    const displayWidth = Math.floor(window.innerWidth * dpr);
+    const displayHeight = Math.floor(window.innerHeight * dpr);
+    if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
+      canvas.width = displayWidth;
+      canvas.height = displayHeight;
+    }
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+
+  const pointerState = {
+    pointers: new Map(),
+    mode: 'none',
+    lastPrimary: { x: 0, y: 0 },
+    pinchStartDist: 0,
+    pinchStartDistance: 0,
+  };
+
+  let userInteracting = false;
+
+  canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+
+  canvas.addEventListener('pointerdown', (event) => {
+    pointerState.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (pointerState.pointers.size === 1) {
+      pointerState.mode = (event.shiftKey || event.button === 2 || event.altKey) ? 'roll' : 'rotate';
+      pointerState.lastPrimary.x = event.clientX;
+      pointerState.lastPrimary.y = event.clientY;
+      userInteracting = true;
+    } else if (pointerState.pointers.size === 2) {
+      const points = Array.from(pointerState.pointers.values());
+      const dx = points[0].x - points[1].x;
+      const dy = points[0].y - points[1].y;
+      pointerState.pinchStartDist = Math.hypot(dx, dy);
+      pointerState.pinchStartDistance = camera.distance;
+      pointerState.mode = 'pinch';
+    }
+    try {
+      canvas.setPointerCapture(event.pointerId);
+    } catch (err) {
+      /* ignore */
+    }
+  });
+
+  canvas.addEventListener('pointermove', (event) => {
+    if (!pointerState.pointers.has(event.pointerId)) {
+      return;
+    }
+    const pointer = pointerState.pointers.get(event.pointerId);
+    pointer.x = event.clientX;
+    pointer.y = event.clientY;
+
+    if (pointerState.mode === 'pinch' && pointerState.pointers.size >= 2) {
+      const points = Array.from(pointerState.pointers.values());
+      const dx = points[0].x - points[1].x;
+      const dy = points[0].y - points[1].y;
+      const dist = Math.max(10, Math.hypot(dx, dy));
+      if (pointerState.pinchStartDist > 0) {
+        const ratio = dist / pointerState.pinchStartDist;
+        camera.distance = pointerState.pinchStartDistance * ratio;
+        clampCamera();
+      }
+    } else if (pointerState.pointers.size === 1) {
+      const dx = event.clientX - pointerState.lastPrimary.x;
+      const dy = event.clientY - pointerState.lastPrimary.y;
+      pointerState.lastPrimary.x = event.clientX;
+      pointerState.lastPrimary.y = event.clientY;
+      if (pointerState.mode === 'rotate') {
+        camera.roll += dx * 0.0045;
+        camera.pitch -= dy * 0.0045;
+        clampCamera();
+      } else if (pointerState.mode === 'roll') {
+        camera.roll += dx * 0.01;
+        clampCamera();
+      }
+    }
+  });
+
+  function endPointer(event) {
+    pointerState.pointers.delete(event.pointerId);
+    if (pointerState.pointers.size === 0) {
+      pointerState.mode = 'none';
+      userInteracting = false;
+    } else if (pointerState.pointers.size === 1) {
+      pointerState.mode = 'rotate';
+      const remaining = pointerState.pointers.values().next().value;
+      pointerState.lastPrimary.x = remaining.x;
+      pointerState.lastPrimary.y = remaining.y;
+    }
+    try {
+      canvas.releasePointerCapture(event.pointerId);
+    } catch (err) {
+      /* ignore */
+    }
+  }
+
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('pointerout', (event) => {
+    if (!canvas.contains(document.elementFromPoint(event.clientX, event.clientY))) {
+      endPointer(event);
+    }
+  });
+
+  let lastTapTime = 0;
+  canvas.addEventListener('pointerdown', (event) => {
+    const now = performance.now();
+    if (now - lastTapTime < 350) {
+      camera.yaw = 0.9;
+      camera.pitch = 0.35;
+      camera.roll = 0.0;
+      camera.distance = CAMERA_DISTANCE_INITIAL;
+      clampCamera();
+    }
+    lastTapTime = now;
+  }, { capture: true });
+
+  canvas.addEventListener('wheel', (event) => {
+    event.preventDefault();
+    const scale = Math.exp(event.deltaY * 0.001);
+    camera.distance *= scale;
+    clampCamera();
+  }, { passive: false });
+
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'q' || event.key === 'Q') {
+      camera.roll -= 0.08;
+    } else if (event.key === 'e' || event.key === 'E') {
+      camera.roll += 0.08;
+    } else if (event.key === 'r' || event.key === 'R') {
+      camera.yaw = 0.9;
+      camera.pitch = 0.35;
+      camera.roll = 0.0;
+      camera.distance = CAMERA_DISTANCE_INITIAL;
+      clampCamera();
+    }
+  });
+
+  function fract(x) {
+    return x - Math.floor(x);
+  }
+
+  function jitter(pass, total, frame) {
+    const idx = frame * total + pass;
+    const jx = fract((idx + 0.5) * 0.61803398875) - 0.5;
+    const jy = fract((idx + 0.5) * 0.32360679775) - 0.5;
+    return [jx, jy];
+  }
+
+  const startTime = performance.now();
+  let frameCount = 0;
+  let lastFrameTime = startTime;
+  let fps = 0;
+
+  function render(now) {
+    if (typeof now !== "number") {
+      now = performance.now();
+    }
+    const elapsed = (now - startTime) * 0.001;
+    const delta = (now - lastFrameTime) * 0.001;
+    const currentFPS = delta > 1e-6 ? 1 / delta : 0;
+    fps = frameCount === 0 ? currentFPS : fps * 0.9 + currentFPS * 0.1;
+    lastFrameTime = now;
+    resizeCanvas();
+
+    const difficulty = 1.0 + elapsed * 0.12;
+    const diffGrowth = Math.max(0.0, difficulty - 1.0);
+    const passes = Math.min(12, 1 + Math.floor(diffGrowth * 0.55));
+    const rayStep = Math.max(0.045, 1.0 / (1.0 + diffGrowth * 0.35));
+    const maxSteps = Math.min(260.0, 70.0 + diffGrowth * 14.0 + passes * 6.0);
+    const fractalIterations = Math.min(16.0, 6.0 + diffGrowth * 0.45 + passes * 0.2);
+
+    clampCamera();
+    updateCamera();
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.uniform2f(uniforms.resolution, canvas.width, canvas.height);
+    gl.uniformMatrix3fv(uniforms.camera, false, cameraMatrix);
+    gl.uniform3fv(uniforms.cameraPos, cameraPos);
+    gl.uniform1f(uniforms.stepScale, rayStep);
+    gl.uniform1f(uniforms.difficulty, difficulty);
+    gl.uniform1f(uniforms.maxSteps, maxSteps);
+    gl.uniform1f(uniforms.fractalIterations, fractalIterations);
+    gl.uniform1i(uniforms.totalPasses, passes);
+
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    for (let pass = 0; pass < passes; pass++) {
+      const j = jitter(pass, passes, frameCount);
+      gl.uniform1i(uniforms.passIndex, pass);
+      gl.uniform1f(uniforms.time, elapsed + pass * 0.0007);
+      gl.uniform2f(uniforms.jitter, j[0], j[1]);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    hud.innerHTML = `Elapsed: ${elapsed.toFixed(1)}s<br>FPS: ${fps.toFixed(1)}<br>Frames: ${frameCount}<br>Difficulty: ${difficulty.toFixed(2)}<br>Passes: ${passes}<br>Ray Step: ${rayStep.toFixed(3)}`;
+
+    frameCount += 1;
+    requestAnimationFrame(render);
+  }
+
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>
